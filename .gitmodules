@@ -1,0 +1,3 @@
+[submodule "vendor/FunPayCardinal"]
+	path = vendor/FunPayCardinal
+	url = https://github.com/sidor0912/FunPayCardinal.git

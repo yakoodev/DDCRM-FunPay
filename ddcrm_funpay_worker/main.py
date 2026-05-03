@@ -229,8 +229,8 @@ async def worker_capabilities(request: Request):
         "conversations.messages.list": True,
         "conversations.messages.send": True,
         "products.list": True,
-        "products.create": False,
-        "products.update": False,
+        "products.create": True,
+        "products.update": True,
         "products.delete": True,
         "schemas.products.list": True,
     }
@@ -329,12 +329,17 @@ async def worker_product_create(request: Request, body: dict[str, Any]):
 
 
 def _build_product_create_response(request: Request, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    # Жёстко провалидируем body перед runtime поведением для корректного contract surface.
     from .models import WorkerV2ProductCreateRequest
 
-    WorkerV2ProductCreateRequest.model_validate(body)
-    adapter.create_product_not_supported()
-    raise RuntimeError("unreachable")
+    parsed = WorkerV2ProductCreateRequest.model_validate(body)
+    created = adapter.create_product(_require_bound_account_id(), parsed)
+    response = WorkerV2ProductMutationResponse(
+        requestId=_request_id(request),
+        productId=created.productId,
+        status="created",
+        version=created.version,
+    )
+    return 200, response.model_dump(mode="json")
 
 
 @app.patch("/internal/v2/worker/products/{product_id}")
@@ -355,8 +360,14 @@ def _build_product_update_response(
 ) -> tuple[int, dict[str, Any]]:
     if not body.changes.model_dump(exclude_none=True):
         raise platform_error("Требуется минимум одно поле в changes.")
-    adapter.update_product_not_supported()
-    raise RuntimeError("unreachable")
+    updated = adapter.update_product(_require_bound_account_id(), product_id, body.changes, body.expectedVersion)
+    response = WorkerV2ProductMutationResponse(
+        requestId=_request_id(request),
+        productId=updated.productId,
+        status="updated",
+        version=updated.version,
+    )
+    return 200, response.model_dump(mode="json")
 
 
 @app.delete("/internal/v2/worker/products/{product_id}")
@@ -395,6 +406,15 @@ async def worker_product_schemas(request: Request, schemaId: str | None = None, 
                 WorkerV2ProductSchemaField(key="price.amount", type="number", required=True),
                 WorkerV2ProductSchemaField(key="price.currency", type="string", required=True),
                 WorkerV2ProductSchemaField(key="quantity", type="integer", required=False),
+                WorkerV2ProductSchemaField(key="attributes.templateLotId", type="integer", required=True),
+                WorkerV2ProductSchemaField(key="attributes.summaryRu", type="string", required=False),
+                WorkerV2ProductSchemaField(key="attributes.summaryEn", type="string", required=False),
+                WorkerV2ProductSchemaField(key="attributes.descriptionRu", type="string", required=False),
+                WorkerV2ProductSchemaField(key="attributes.descriptionEn", type="string", required=False),
+                WorkerV2ProductSchemaField(key="attributes.paymentMessageRu", type="string", required=False),
+                WorkerV2ProductSchemaField(key="attributes.paymentMessageEn", type="string", required=False),
+                WorkerV2ProductSchemaField(key="attributes.autoDelivery", type="boolean", required=False),
+                WorkerV2ProductSchemaField(key="attributes.deactivateAfterSale", type="boolean", required=False),
             ],
         )
     ]

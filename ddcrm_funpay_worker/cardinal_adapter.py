@@ -8,9 +8,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from .config import WorkerConfig
 from .errors import ApiError, WorkerErrorCodes, platform_error, runtime_conflict
-from .models import WorkerV2AccountInfo, WorkerV2ConversationMessage, WorkerV2ConversationSummary, WorkerV2Product
+from .models import (
+    WorkerV2AccountInfo,
+    WorkerV2ConversationMessage,
+    WorkerV2ConversationSummary,
+    WorkerV2Product,
+    WorkerV2ProductChanges,
+    WorkerV2ProductCreateRequest,
+)
 from .storage import WorkerStateStorage
 
 
@@ -104,8 +114,22 @@ class CardinalAdapter:
         client = Account(
             credentials.golden_key,
             user_agent=credentials.user_agent,
+            requests_timeout=self._config.funpay_request_timeout_seconds,
             proxy=credentials.proxy,
         )
+        retry_strategy = Retry(
+            total=self._config.funpay_http_max_retries,
+            connect=self._config.funpay_http_max_retries,
+            read=self._config.funpay_http_max_retries,
+            redirect=self._config.funpay_http_max_retries,
+            status=self._config.funpay_http_max_retries,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods={"GET", "POST"},
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        client.session.mount("https://", adapter)
+        client.session.mount("http://", adapter)
         return client, credentials
 
     def account_info(self, account_id: str) -> WorkerV2AccountInfo:
@@ -243,11 +267,72 @@ class CardinalAdapter:
         products.sort(key=lambda item: item.productId, reverse=True)
         return products
 
-    def create_product_not_supported(self) -> None:
-        raise runtime_conflict("products.create в Cardinal adapter v1 пока не поддержан.")
+    def create_product(self, account_id: str, request: WorkerV2ProductCreateRequest) -> WorkerV2Product:
+        client, _ = self._create_account_client(account_id)
+        attributes = request.attributes or {}
 
-    def update_product_not_supported(self) -> None:
-        raise runtime_conflict("products.update в Cardinal adapter v1 пока не поддержан.")
+        template_lot_id = self._require_template_lot_id(attributes)
+        before_products = self.list_products(account_id)
+        before_product_ids = {item.productId for item in before_products}
+
+        try:
+            client.get()
+            lot_fields = client.get_lot_fields(template_lot_id)
+            lot_fields.lot_id = 0
+            self._apply_product_create_fields(lot_fields, request)
+            client.save_lot(lot_fields)
+        except Exception as exc:  # pragma: no cover - network runtime
+            self._translate_exception(exc)
+
+        after_products = self.list_products(account_id)
+        for item in after_products:
+            if item.productId not in before_product_ids:
+                return item
+
+        for item in after_products:
+            if item.title == request.title and abs(item.price.amount - request.price.amount) < 0.0001:
+                return item
+
+        raise runtime_conflict(
+            "Лот сохранен, но новый productId не удалось определить автоматически.",
+            details={"deferred": True},
+        )
+
+    def update_product(
+        self,
+        account_id: str,
+        product_id: str,
+        changes: WorkerV2ProductChanges,
+        expected_version: str | None,
+    ) -> WorkerV2Product:
+        client, _ = self._create_account_client(account_id)
+        current = next((item for item in self.list_products(account_id) if item.productId == product_id), None)
+        if current is None:
+            raise platform_error("Продукт не найден для update.", status_code=404)
+
+        if expected_version and current.version != expected_version:
+            raise runtime_conflict(
+                "Версия продукта не совпадает (optimistic concurrency).",
+                details={"expectedVersion": expected_version, "actualVersion": current.version},
+            )
+
+        try:
+            numeric_product_id = int(product_id)
+        except ValueError as exc:
+            raise platform_error("productId должен быть числовым идентификатором FunPay лота.") from exc
+
+        try:
+            client.get()
+            lot_fields = client.get_lot_fields(numeric_product_id)
+            self._apply_product_update_fields(lot_fields, changes)
+            client.save_lot(lot_fields)
+        except Exception as exc:  # pragma: no cover - network runtime
+            self._translate_exception(exc)
+
+        refreshed = next((item for item in self.list_products(account_id) if item.productId == product_id), None)
+        if refreshed is None:
+            raise runtime_conflict("Лот обновлен, но не удалось повторно прочитать productId после save.", details={"productId": product_id})
+        return refreshed
 
     def delete_product(self, account_id: str, product_id: str) -> str:
         client, _ = self._create_account_client(account_id)
@@ -260,6 +345,96 @@ class CardinalAdapter:
         except Exception as exc:  # pragma: no cover - network runtime
             self._translate_exception(exc)
         return f"deleted:{product_id}:{int(datetime.now(UTC).timestamp())}"
+
+    @staticmethod
+    def _require_template_lot_id(attributes: dict[str, Any]) -> int:
+        candidate = attributes.get("templateLotId") or attributes.get("template_lot_id")
+        if candidate is None:
+            raise platform_error("Для products.create требуется attributes.templateLotId.")
+
+        try:
+            return int(candidate)
+        except (TypeError, ValueError) as exc:
+            raise platform_error("attributes.templateLotId должен быть числом (id шаблонного лота).") from exc
+
+    @staticmethod
+    def _resolve_bool(value: Any) -> bool | None:
+        if value is None:
+            return None
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        return None
+
+    def _apply_product_create_fields(self, lot_fields: Any, request: WorkerV2ProductCreateRequest) -> None:
+        lot_fields.title_ru = request.title.strip()
+        if request.description is not None:
+            lot_fields.description_ru = request.description
+        lot_fields.price = request.price.amount
+
+        if request.quantity is not None:
+            lot_fields.amount = request.quantity
+
+        normalized_status = (request.status or "active").strip().lower()
+        lot_fields.active = normalized_status == "active"
+
+        attributes = request.attributes or {}
+        self._apply_platform_specific_lot_attributes(lot_fields, attributes)
+
+    def _apply_product_update_fields(self, lot_fields: Any, changes: WorkerV2ProductChanges) -> None:
+        if changes.title is not None:
+            lot_fields.title_ru = changes.title.strip()
+        if changes.description is not None:
+            lot_fields.description_ru = changes.description
+        if changes.price is not None:
+            lot_fields.price = changes.price.amount
+        if changes.quantity is not None:
+            lot_fields.amount = changes.quantity
+        if changes.status is not None:
+            normalized_status = changes.status.strip().lower()
+            lot_fields.active = normalized_status == "active"
+        if changes.attributes:
+            self._apply_platform_specific_lot_attributes(lot_fields, changes.attributes)
+
+    def _apply_platform_specific_lot_attributes(self, lot_fields: Any, attributes: dict[str, Any]) -> None:
+        summary_ru = attributes.get("summaryRu")
+        if isinstance(summary_ru, str) and summary_ru.strip():
+            lot_fields.title_ru = summary_ru.strip()
+
+        summary_en = attributes.get("summaryEn")
+        if isinstance(summary_en, str) and summary_en.strip():
+            lot_fields.title_en = summary_en.strip()
+
+        description_ru = attributes.get("descriptionRu")
+        if isinstance(description_ru, str):
+            lot_fields.description_ru = description_ru
+
+        description_en = attributes.get("descriptionEn")
+        if isinstance(description_en, str):
+            lot_fields.description_en = description_en
+
+        payment_msg_ru = attributes.get("paymentMessageRu")
+        if isinstance(payment_msg_ru, str):
+            lot_fields.payment_msg_ru = payment_msg_ru
+
+        payment_msg_en = attributes.get("paymentMessageEn")
+        if isinstance(payment_msg_en, str):
+            lot_fields.payment_msg_en = payment_msg_en
+
+        auto_delivery = self._resolve_bool(attributes.get("autoDelivery"))
+        if auto_delivery is not None:
+            lot_fields.auto_delivery = auto_delivery
+
+        deactivate_after_sale = self._resolve_bool(attributes.get("deactivateAfterSale"))
+        if deactivate_after_sale is not None:
+            lot_fields.deactivate_after_sale = deactivate_after_sale
 
     def _version_from_lot(self, lot: Any) -> str:
         payload = {

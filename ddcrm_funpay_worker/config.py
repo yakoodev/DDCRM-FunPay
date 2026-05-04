@@ -16,6 +16,22 @@ def _parse_csv(value: str | None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_int(value: str | None, default: int, *, min_value: int, max_value: int) -> int:
+    if value is None:
+        return default
+
+    try:
+        parsed = int(value.strip())
+    except (TypeError, ValueError):
+        return default
+
+    if parsed < min_value:
+        return min_value
+    if parsed > max_value:
+        return max_value
+    return parsed
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     bind_host: str
@@ -30,6 +46,8 @@ class WorkerConfig:
     bound_account_id: str | None
     funpay_golden_key: str | None
     funpay_user_agent: str | None
+    funpay_request_timeout_seconds: int
+    funpay_http_max_retries: int
 
     @staticmethod
     def load() -> "WorkerConfig":
@@ -72,4 +90,16 @@ class WorkerConfig:
             bound_account_id=bound_account_id,
             funpay_golden_key=(os.getenv("FUNPAY_GOLDEN_KEY") or "").strip() or None,
             funpay_user_agent=(os.getenv("FUNPAY_USER_AGENT") or "").strip() or None,
+            funpay_request_timeout_seconds=_parse_int(
+                os.getenv("FUNPAY_REQUEST_TIMEOUT_SECONDS") or os.getenv("FUNPAY_REQUEST_TIMEOUT"),
+                default=8,
+                min_value=3,
+                max_value=60,
+            ),
+            funpay_http_max_retries=_parse_int(
+                os.getenv("FUNPAY_HTTP_MAX_RETRIES") or os.getenv("FUNPAY_MAX_RETRIES"),
+                default=1,
+                min_value=0,
+                max_value=6,
+            ),
         )

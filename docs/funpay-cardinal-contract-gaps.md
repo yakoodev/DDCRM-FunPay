@@ -22,8 +22,8 @@
 
 3.1 `products.create/products.update`:
    - DDCRM контракт допускает универсальное создание/патч продукта.
-   - Cardinal требует platform-specific набор `LotFields`, который нельзя полностью восстановить из канонического DTO без дополнительных полей.
-   - Статус: `deferred` (V1 возвращает `WORKER_RUNTIME_CONFLICT` для create/update; `delete` поддержан для numeric lot id).
+   - Cardinal требует platform-specific набор `LotFields`; V1.1 использует `attributes.templateLotId` как шаблон для клонирования/редактирования.
+   - Статус: `partial` (`create/update` поддержаны, но требуют template-based flow и platform fields в schema).
 
 4. `message attachments` в `conversations.messages.send`:
    - DDCRM контракт допускает массив `attachments`.

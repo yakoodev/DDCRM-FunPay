@@ -11,7 +11,7 @@ COPY vendor/FunPayCardinal ./vendor/FunPayCardinal
 COPY entrypoint.sh ./entrypoint.sh
 
 RUN pip install --no-cache-dir .
-RUN chmod +x ./entrypoint.sh
+RUN sed -i 's/\r$//' ./entrypoint.sh && chmod +x ./entrypoint.sh
 
 EXPOSE 8080
 
